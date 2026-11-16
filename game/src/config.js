@@ -61,7 +61,7 @@ export const ENEMIES = {
   husk:  { key: 'husk',  name: 'Husk',          hp: 100,  speed: 34, bounty: 12,  radius: 20, color: '#b8a7e6', leak: 1 },
   shade: { key: 'shade', name: 'Shade',         hp: 52,   speed: 52, bounty: 9,   radius: 15, color: '#7d6bd6', leak: 1 },
   moth:  { key: 'moth',  name: 'Moth Swarm',    hp: 15,   speed: 95, bounty: 4,   radius: 10, color: '#ffd27f', leak: 1 },
-  dread: { key: 'dread', name: 'Dread Captain', hp: 2600, speed: 26, bounty: 300, radius: 34, color: '#ff5d7a', leak: 5 },
+  dread: { key: 'dread', name: 'Dread Captain', hp: 3200, speed: 26, bounty: 300, radius: 34, color: '#ff5d7a', leak: 5 },
 };
 
 // The Dread Captain's telegraphed slam: every SLAM_INTERVAL seconds he
@@ -84,17 +84,17 @@ export const WAVES = [
   [['wisp', 14], ['husk', 6], ['moth', 10]],
   [['shade', 12], ['husk', 8], ['moth', 12]],
   [['husk', 12], ['shade', 12], ['wisp', 12]],
-  [['moth', 22], ['husk', 10], ['shade', 10]],
-  [['husk', 14], ['shade', 16], ['wisp', 16], ['moth', 14]],
+  [['moth', 26], ['husk', 12], ['shade', 10]],
+  [['husk', 14], ['shade', 18], ['wisp', 16], ['moth', 16]],
   [['dread', 1], ['shade', 10], ['husk', 8], ['moth', 12]],
 ];
-export const WAVE_HP_MULT = [1, 1.1, 1.22, 1.38, 1.55, 1.75, 2.0, 2.3, 2.65, 3.1];
+export const WAVE_HP_MULT = [1, 1.12, 1.26, 1.42, 1.62, 1.85, 2.15, 2.5, 2.9, 3.4];
 export const SPAWN_GAP = 0.85; // seconds between spawns inside a wave
 
 // Boons offered between waves: pick one of three.
 export const BOONS = [
   { key: 'gold',   name: 'Ember Cache',    desc: '+120 gold right now',         icon: '◈' },
-  { key: 'repair', name: 'Mend the Light', desc: 'Restore 6 lighthouse light', icon: '✚' },
+  { key: 'repair', name: 'Mend the Light', desc: 'Restore 4 lighthouse light', icon: '✚' },
   { key: 'power',  name: 'Kindled Wicks',  desc: 'All towers +15% damage',     icon: '▲' },
   { key: 'range',  name: 'Far Sight',      desc: 'All towers +12% range',      icon: '◎' },
   { key: 'haste',  name: 'Quick Hands',    desc: 'All towers fire 12% faster', icon: '≫' },

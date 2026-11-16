@@ -133,6 +133,7 @@ export function applyHit(state, proj) {
   if (def.burn) {
     target.burnUntil = state.time + def.burnTime;
     target.burnDps = def.burn * Math.pow(UPGRADE_MULT, t.level - 1);
+    target.burnTower = t; // so a burn kill credits the tower that lit it
   }
   if (def.slow) {
     target.slowUntil = state.time + def.slowTime;

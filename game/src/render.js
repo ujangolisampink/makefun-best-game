@@ -1,19 +1,26 @@
 // EMBERFALL KEEP — render.js
-// Every pixel of the game: night sky, lighthouse beam, village, lanes,
-// mid-field scenery, towers, enemies, HUD and all screens. The judge
-// sees the game mostly through screenshots, so this file is where the
-// game wins or loses.
-//
-// Polish notes (v2): the mid-field is dressed with fixed-seed scenery
-// (rocks, grass tufts, glow-shrooms, ember flowers) so the lanes never
-// read as empty bands; every tower type has its own silhouette and gains
-// visible extras as it levels up; and the Dread Captain is telegraphed
-// hard — a red vignette and portal while he arrives, a growing red ring
-// during his slam windup, a boss health bar at the top, and dizzy stars
-// over towers his slam stuns.
-import { VIEW_W, VIEW_H, TOWERS, TOWER_KEYS, LANES_Y, PLOT_ROWS_Y, PLOT_COLS_X, PLOT_R, MAX_WAVE, UPGRADE_COST, SELL_FRACTION, LIGHTHOUSE_X, SCENERY, SLAM_RADIUS } from './config.js';
+// Every pixel of the game, drawn fresh each frame on the 2D canvas.
+// The renderer owns no game logic: it reads the state the simulation
+// modules own and turns it into the dusk-lit field the player sees —
+// the night sky and the moon, the lighthouse and its sweeping beam,
+// the three lanes, the build plots, the four tower kinds with their
+// level extras, the five enemy kinds, projectiles, particles and
+// floating combat text, plus the HUD, the build menu, the boon cards
+// and the title / victory / defeat panels. Nothing here mutates state.
+import {
+  VIEW_W, VIEW_H, TOWERS, TOWER_KEYS, ENEMIES, WAVES, LANES_Y,
+  PLOT_ROWS_Y, PLOT_COLS_X, PLOT_R, LIGHTHOUSE_X, GOAL_X,
+  START_LIVES, MAX_WAVE, UPGRADE_COST, UPGRADE_MULT, SELL_FRACTION,
+  SLAM_RADIUS, SLAM_WINDUP, SCENERY,
+} from './config.js';
 
-function roundRect(ctx, x, y, w, h, r) {
+const GOLD = '#f5c86e';
+const INK = '#e8eaf6';
+const DIM = '#9aa3c7';
+
+// ---------- small canvas helpers ----------
+
+function rr(ctx, x, y, w, h, r) {
   ctx.beginPath();
   ctx.moveTo(x + r, y);
   ctx.arcTo(x + w, y, x + w, y + h, r);
@@ -23,15 +30,39 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.closePath();
 }
 
-function glowCircle(ctx, x, y, r, color, alpha) {
+function disc(ctx, x, y, r) {
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+}
+
+function text(ctx, str, x, y, font, color, align = 'center', alpha = 1) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.font = font;
+  ctx.fillStyle = color;
+  ctx.textAlign = align;
+  ctx.textBaseline = 'middle';
+  ctx.fillText(str, x, y);
+  ctx.restore();
+}
+
+// A soft radial glow: a bright core fading out to nothing.
+function glow(ctx, x, y, r, color, peak = 0.55) {
   const g = ctx.createRadialGradient(x, y, 0, x, y, r);
   g.addColorStop(0, color);
-  g.addColorStop(1, 'rgba(0,0,0,0)');
-  ctx.globalAlpha = alpha;
+  g.addColorStop(1, 'rgba(0, 0, 0, 0)');
+  ctx.save();
+  ctx.globalAlpha = peak;
   ctx.fillStyle = g;
-  ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
-  ctx.globalAlpha = 1;
+  ctx.fillRect(x - r, y - r, r * 2, r * 2);
+  ctx.restore();
 }
+
+function clamp(v, lo, hi) {
+  return Math.max(lo, Math.min(hi, v));
+}
+
+// ---------- the frame ----------
 
 export function render(ctx, state, mouse) {
   ctx.save();
@@ -39,688 +70,969 @@ export function render(ctx, state, mouse) {
     ctx.translate((Math.random() - 0.5) * state.shake, (Math.random() - 0.5) * state.shake);
   }
   drawSky(ctx, state);
-  drawVillage(ctx, state);
-  drawLanes(ctx, state);
+  drawLanes(ctx);
   drawScenery(ctx, state);
   drawPlots(ctx, state, mouse);
-  drawTowers(ctx, state, mouse);
-  drawEnemies(ctx, state);
+  drawLighthouse(ctx, state);
+  for (const t of state.towers) drawTower(ctx, state, t);
+  for (const e of state.enemies) drawEnemy(ctx, state, e);
   drawProjectiles(ctx, state);
   drawParticles(ctx, state);
   drawFloats(ctx, state);
-  drawLighthouse(ctx, state);
-  drawHud(ctx, state);
-  drawBossBar(ctx, state);
-  if (state.bossWarn > 0 || state.enemies.some((e) => e.key === 'dread')) drawBossVignette(ctx, state);
-  if (state.bannerTimer > 0 && state.screen === 'playing') drawBanner(ctx, state);
-  if (state.screen === 'title') drawTitle(ctx, state);
-  if (state.screen === 'boon') drawBoon(ctx, state);
-  if (state.screen === 'victory') drawEnd(ctx, state, true);
-  if (state.screen === 'defeat') drawEnd(ctx, state, false);
-  if (state.paused && state.screen === 'playing') drawPaused(ctx);
+  drawBeam(ctx, state);
   ctx.restore();
+
+  drawBossBar(ctx, state);
+  drawHud(ctx, state);
+  drawHintBar(ctx, state);
+  drawLightMeter(ctx, state);
+  drawVignette(ctx, state);
+  if (state.screen === 'playing') {
+    if (state.paused) drawPaused(ctx);
+    drawBuildMenu(ctx, state);
+    drawTowerPanel(ctx, state);
+  }
+  drawBanner(ctx, state);
+  if (state.screen === 'title') drawTitle(ctx, state);
+  else if (state.screen === 'boon') drawBoon(ctx, state);
+  else if (state.screen === 'victory') drawVictory(ctx, state);
+  else if (state.screen === 'defeat') drawDefeat(ctx, state);
 }
+
+// ---------- sky, moon, houses ----------
 
 function drawSky(ctx, state) {
-  const g = ctx.createLinearGradient(0, 0, 0, VIEW_H);
-  g.addColorStop(0, '#0b1030');
-  g.addColorStop(0.45, '#1b2350');
-  g.addColorStop(0.75, '#3a2b5e');
-  g.addColorStop(1, '#1a1430');
-  ctx.fillStyle = g;
-  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
-  // Stars.
-  for (const s of state.stars) {
-    ctx.globalAlpha = 0.35 + 0.65 * Math.abs(Math.sin(state.time * 1.4 + s.tw));
-    ctx.fillStyle = '#dfe8ff';
-    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2); ctx.fill();
-  }
-  ctx.globalAlpha = 1;
-  // Aurora ribbons.
-  ctx.save();
-  ctx.globalAlpha = 0.16;
-  for (let i = 0; i < 3; i++) {
-    ctx.fillStyle = i % 2 ? '#37e6a0' : '#7fd4ff';
-    ctx.beginPath();
-    const base = 60 + i * 34;
-    ctx.moveTo(0, base);
-    for (let x = 0; x <= VIEW_W; x += 64) {
-      ctx.lineTo(x, base + Math.sin(x * 0.006 + state.time * 0.4 + i * 2) * 22);
-    }
-    for (let x = VIEW_W; x >= 0; x -= 64) {
-      ctx.lineTo(x, base + 26 + Math.sin(x * 0.006 + state.time * 0.4 + i * 2) * 22);
-    }
-    ctx.closePath(); ctx.fill();
-  }
-  ctx.restore();
-  // Moon.
-  glowCircle(ctx, 1150, 82, 90, '#fff6d8', 0.5);
-  ctx.fillStyle = '#fff8e0';
-  ctx.beginPath(); ctx.arc(1150, 82, 34, 0, Math.PI * 2); ctx.fill();
-  ctx.fillStyle = '#e8ddba';
-  ctx.beginPath(); ctx.arc(1138, 74, 7, 0, Math.PI * 2); ctx.fill();
-  ctx.beginPath(); ctx.arc(1162, 92, 5, 0, Math.PI * 2); ctx.fill();
-  // Drifting embers.
-  for (const e of state.embers) {
-    ctx.globalAlpha = 0.5;
-    ctx.fillStyle = '#ffb347';
-    ctx.beginPath(); ctx.arc(e.x, e.y, 1.8, 0, Math.PI * 2); ctx.fill();
-  }
-  ctx.globalAlpha = 1;
-  // Ground.
-  const gg = ctx.createLinearGradient(0, 140, 0, VIEW_H);
-  gg.addColorStop(0, '#232a4a');
-  gg.addColorStop(1, '#141126');
-  ctx.fillStyle = gg;
-  ctx.fillRect(0, 140, VIEW_W, VIEW_H - 140);
-}
+  const sky = ctx.createLinearGradient(0, 0, 0, VIEW_H);
+  sky.addColorStop(0, '#0d1233');
+  sky.addColorStop(0.45, '#141b40');
+  sky.addColorStop(1, '#0a0e26');
+  ctx.fillStyle = sky;
+  ctx.fillRect(-20, -20, VIEW_W + 40, VIEW_H + 40);
 
-function drawVillage(ctx, state) {
-  // Cosy houses along the top, warm windows glowing.
+  // Slow teal ribbons of cloud drifting across the night sky.
+  const bands = [
+    { y: 62, amp: 16, color: 'rgba(46, 98, 116, 0.28)' },
+    { y: 108, amp: 20, color: 'rgba(38, 66, 116, 0.22)' },
+    { y: 152, amp: 12, color: 'rgba(66, 46, 116, 0.16)' },
+  ];
+  for (const b of bands) {
+    ctx.fillStyle = b.color;
+    ctx.beginPath();
+    ctx.moveTo(-20, b.y - 26);
+    for (let x = -20; x <= VIEW_W + 20; x += 40) {
+      ctx.lineTo(x, b.y + Math.sin(x * 0.006 + state.time * 0.08) * b.amp - 14);
+    }
+    for (let x = VIEW_W + 20; x >= -20; x -= 40) {
+      ctx.lineTo(x, b.y + Math.sin(x * 0.006 + state.time * 0.08) * b.amp + 14);
+    }
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // Stars, twinkling on their own slow rhythm.
+  for (const s of state.stars) {
+    const a = 0.25 + 0.65 * Math.abs(Math.sin(state.time * 1.4 + s.tw));
+    ctx.globalAlpha = a;
+    ctx.fillStyle = '#dfe6ff';
+    ctx.fillRect(s.x, s.y, s.r, s.r);
+  }
+  ctx.globalAlpha = 1;
+
+  // The moon, high on the right, with a soft halo and two craters.
+  glow(ctx, 1212, 88, 78, 'rgba(240, 235, 210, 0.35)', 0.5);
+  ctx.fillStyle = '#efe9d2';
+  disc(ctx, 1212, 88, 38);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(198, 188, 158, 0.55)';
+  disc(ctx, 1200, 78, 6);
+  ctx.fill();
+  disc(ctx, 1224, 100, 4);
+  ctx.fill();
+
+  // Rooftops of the town behind the field, windows lit warm.
   const houses = [
-    { x: 250, y: 118, w: 86, h: 52 }, { x: 430, y: 108, w: 72, h: 62 },
-    { x: 640, y: 116, w: 92, h: 54 }, { x: 860, y: 106, w: 76, h: 64 },
-    { x: 1060, y: 114, w: 88, h: 56 },
+    { x: 270, w: 118, h: 76 }, { x: 465, w: 104, h: 66 },
+    { x: 655, w: 122, h: 80 }, { x: 845, w: 108, h: 70 },
+    { x: 1055, w: 116, h: 74 },
   ];
   for (const h of houses) {
-    ctx.fillStyle = '#2c2140';
-    ctx.fillRect(h.x, h.y - h.h, h.w, h.h);
-    ctx.fillStyle = '#3a2c55';
+    const top = 118 - h.h;
+    ctx.fillStyle = '#241d4e';
+    ctx.fillRect(h.x - h.w / 2, top + 14, h.w, h.h - 14);
+    ctx.fillStyle = '#1a1438';
     ctx.beginPath();
-    ctx.moveTo(h.x - 6, h.y - h.h);
-    ctx.lineTo(h.x + h.w / 2, h.y - h.h - 30);
-    ctx.lineTo(h.x + h.w + 6, h.y - h.h);
-    ctx.closePath(); ctx.fill();
-    const flick = 0.75 + 0.25 * Math.sin(state.time * 2 + h.x);
-    ctx.globalAlpha = flick;
-    ctx.fillStyle = '#ffd27f';
-    ctx.fillRect(h.x + 14, h.y - h.h + 16, 14, 14);
-    ctx.fillRect(h.x + h.w - 30, h.y - h.h + 16, 14, 14);
-    ctx.globalAlpha = 1;
+    ctx.moveTo(h.x - h.w / 2 - 6, top + 16);
+    ctx.lineTo(h.x, top - 8);
+    ctx.lineTo(h.x + h.w / 2 + 6, top + 16);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = 'rgba(255, 210, 127, 0.9)';
+    ctx.fillRect(h.x - h.w / 2 + 16, top + 34, 13, 15);
+    ctx.fillRect(h.x + h.w / 2 - 29, top + 34, 13, 15);
   }
+
+  // Drifting embers rising off the field.
+  for (const e of state.embers) {
+    ctx.globalAlpha = 0.35 + 0.3 * Math.sin(state.time * 2 + e.drift);
+    ctx.fillStyle = '#ffb347';
+    disc(ctx, e.x, e.y, e.s * 2.2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
 }
 
-function drawLanes(ctx, state) {
-  for (const y of LANES_Y) {
-    ctx.fillStyle = '#2e3358';
-    ctx.fillRect(150, y - 34, VIEW_W - 150, 68);
-    ctx.fillStyle = '#3a4066';
-    for (let x = 170; x < VIEW_W; x += 46) {
-      ctx.fillRect(x, y - 2, 26, 4);
-    }
-    // Chevrons pointing at the lighthouse.
-    ctx.fillStyle = 'rgba(255,210,127,0.25)';
-    for (let x = 220; x < VIEW_W; x += 140) {
-      ctx.beginPath();
-      ctx.moveTo(x, y - 10); ctx.lineTo(x - 12, y); ctx.lineTo(x, y + 10);
-      ctx.lineTo(x + 6, y); ctx.closePath(); ctx.fill();
+// ---------- lanes and scenery ----------
+
+function drawLanes(ctx) {
+  for (const ly of LANES_Y) {
+    ctx.fillStyle = 'rgba(38, 48, 96, 0.35)';
+    ctx.fillRect(GOAL_X, ly - 44, VIEW_W - GOAL_X, 88);
+    ctx.strokeStyle = 'rgba(200, 210, 240, 0.22)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([14, 18]);
+    ctx.beginPath();
+    ctx.moveTo(GOAL_X + 8, ly);
+    ctx.lineTo(VIEW_W - 8, ly);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // Small diamonds marching down the middle of each lane.
+    ctx.fillStyle = 'rgba(200, 210, 240, 0.16)';
+    for (let x = 220; x < VIEW_W - 20; x += 110) {
+      ctx.save();
+      ctx.translate(x, ly);
+      ctx.rotate(Math.PI / 4);
+      ctx.fillRect(-5, -5, 10, 10);
+      ctx.restore();
     }
   }
+  // The goal line the tide must not cross.
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.12)';
+  ctx.lineWidth = 2;
+  ctx.setLineDash([6, 10]);
+  ctx.beginPath();
+  ctx.moveTo(GOAL_X, 120);
+  ctx.lineTo(GOAL_X, 664);
+  ctx.stroke();
+  ctx.setLineDash([]);
 }
 
-// Mid-field dressing: rocks, grass tufts, glow-shrooms and ember flowers
-// from the fixed-seed SCENERY list. Pure decoration, drawn under towers.
 function drawScenery(ctx, state) {
   for (const s of SCENERY) {
-    const pulse = 0.6 + 0.4 * Math.sin(state.time * 1.6 + s.ph);
+    const sway = Math.sin(state.time * 1.5 + s.ph) * 2;
+    ctx.save();
+    ctx.translate(s.x, s.y);
+    ctx.scale(s.s, s.s);
     if (s.kind === 'rock') {
-      ctx.fillStyle = '#3a3455';
-      ctx.beginPath(); ctx.ellipse(s.x, s.y, 9 * s.s, 6 * s.s, 0.3, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = '#4a4368';
-      ctx.beginPath(); ctx.ellipse(s.x - 2 * s.s, s.y - 2 * s.s, 4 * s.s, 2.5 * s.s, 0.3, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#3a4266';
+      ctx.beginPath();
+      ctx.ellipse(0, 0, 11, 6.5, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.08)';
+      ctx.beginPath();
+      ctx.ellipse(-3, -2, 6, 3, 0, 0, Math.PI * 2);
+      ctx.fill();
     } else if (s.kind === 'tuft') {
-      ctx.strokeStyle = '#4a6b4a'; ctx.lineWidth = 1.6;
+      ctx.strokeStyle = '#4a7a55';
+      ctx.lineWidth = 2;
+      ctx.lineCap = 'round';
       for (let i = -1; i <= 1; i++) {
-        ctx.beginPath(); ctx.moveTo(s.x + i * 4 * s.s, s.y);
-        ctx.lineTo(s.x + i * 6 * s.s, s.y - 10 * s.s); ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(i * 4, 0);
+        ctx.quadraticCurveTo(i * 4 + sway, -8, i * 6 + sway, -13);
+        ctx.stroke();
       }
     } else if (s.kind === 'shroom') {
-      ctx.globalAlpha = 0.35 + 0.3 * pulse;
-      glowCircle(ctx, s.x, s.y - 4, 12 * s.s, '#7fd4ff', 0.5);
-      ctx.globalAlpha = 1;
-      ctx.fillStyle = '#c9d6ff';
-      ctx.fillRect(s.x - 1.5 * s.s, s.y - 6 * s.s, 3 * s.s, 6 * s.s);
+      ctx.fillStyle = '#cfe8ff';
+      ctx.fillRect(-2, -2, 4, 7);
       ctx.fillStyle = '#7fd4ff';
-      ctx.beginPath(); ctx.arc(s.x, s.y - 6 * s.s, 6 * s.s, Math.PI, 0); ctx.closePath(); ctx.fill();
-    } else { // ember flowers
-      ctx.globalAlpha = 0.55 + 0.35 * pulse;
+      ctx.beginPath();
+      ctx.arc(0, -2, 7, Math.PI, 0);
+      ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      disc(ctx, -3, -5, 1.4);
+      ctx.fill();
+      disc(ctx, 3, -6, 1.2);
+      ctx.fill();
+    } else {
+      // Ember flowers: four orange petals around a gold heart.
       ctx.fillStyle = '#ff9a3c';
-      for (let i = 0; i < 5; i++) {
-        const a = (i / 5) * Math.PI * 2 + s.ph;
-        ctx.beginPath(); ctx.arc(s.x + Math.cos(a) * 4 * s.s, s.y - 4 * s.s + Math.sin(a) * 4 * s.s, 2.2 * s.s, 0, Math.PI * 2); ctx.fill();
+      for (let i = 0; i < 4; i++) {
+        const a = (i / 4) * Math.PI * 2 + s.ph;
+        disc(ctx, Math.cos(a) * 4, Math.sin(a) * 4, 2.6);
+        ctx.fill();
       }
-      ctx.fillStyle = '#ffe45e';
-      ctx.beginPath(); ctx.arc(s.x, s.y - 4 * s.s, 2 * s.s, 0, Math.PI * 2); ctx.fill();
-      ctx.globalAlpha = 1;
+      ctx.fillStyle = '#ffd27f';
+      disc(ctx, 0, 0, 2.2);
+      ctx.fill();
     }
+    ctx.restore();
   }
+}
+
+// ---------- build plots ----------
+
+function plotOccupied(state, px, py) {
+  return state.towers.some((t) => t.plot.x === px && t.plot.y === py);
 }
 
 function drawPlots(ctx, state, mouse) {
+  const hovered = state.screen === 'playing' && mouse.inside
+    ? nearestPlot(mouse.x, mouse.y) : null;
   for (const py of PLOT_ROWS_Y) {
     for (const px of PLOT_COLS_X) {
-      const occupied = state.towers.some((t) => t.plot.x === px && t.plot.y === py);
-      if (occupied) continue;
-      const hover = mouse.inside && Math.hypot(mouse.x - px, mouse.y - py) < PLOT_R + 6;
-      glowCircle(ctx, px, py, PLOT_R + 8, '#ffb347', hover ? 0.5 : 0.22);
-      ctx.strokeStyle = hover ? '#ffd27f' : 'rgba(255,210,127,0.45)';
-      ctx.lineWidth = hover ? 2.5 : 1.5;
-      ctx.beginPath(); ctx.arc(px, py, PLOT_R, 0, Math.PI * 2); ctx.stroke();
-      ctx.fillStyle = 'rgba(255,210,127,0.35)';
-      ctx.font = 'bold 16px sans-serif';
-      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillText('+', px, py + 1);
+      if (plotOccupied(state, px, py)) continue;
+      const isSel = state.selectedPlot && state.selectedPlot.x === px && state.selectedPlot.y === py;
+      const isHov = hovered && hovered.x === px && hovered.y === py;
+      const pulse = 0.5 + 0.3 * Math.sin(state.time * 2.4 + px * 0.01);
+      ctx.fillStyle = 'rgba(20, 26, 54, 0.55)';
+      disc(ctx, px, py, PLOT_R);
+      ctx.fill();
+      ctx.strokeStyle = isSel ? GOLD : `rgba(201, 168, 106, ${isHov ? 0.95 : 0.55 + pulse * 0.2})`;
+      ctx.lineWidth = isSel ? 2.5 : 1.5;
+      disc(ctx, px, py, PLOT_R);
+      ctx.stroke();
+      if (isSel) {
+        ctx.strokeStyle = `rgba(245, 200, 110, ${0.4 + 0.35 * Math.sin(state.time * 4)})`;
+        ctx.lineWidth = 2;
+        disc(ctx, px, py, PLOT_R + 5);
+        ctx.stroke();
+      }
+      // The little plus that says "build here".
+      ctx.strokeStyle = isHov || isSel ? GOLD : 'rgba(201, 168, 106, 0.8)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(px - 7, py);
+      ctx.lineTo(px + 7, py);
+      ctx.moveTo(px, py - 7);
+      ctx.lineTo(px, py + 7);
+      ctx.stroke();
     }
   }
 }
 
-// Each tower type has its own silhouette, and every level adds visible
-// extras — braziers, icicles, coil rings, thorns — so a maxed tower
-// reads as maxed at a glance. `bob` is a small idle sway from the
-// tower's own phase; `flash` is the muzzle flare right after a shot.
-function drawTowerShape(ctx, t, x, y, time) {
-  const def = t.def;
-  const bob = Math.sin(time * 2 + (t.phase || 0)) * 1.5;
+function nearestPlot(x, y) {
+  for (const py of PLOT_ROWS_Y) {
+    for (const px of PLOT_COLS_X) {
+      const dx = x - px, dy = y - py;
+      if (dx * dx + dy * dy <= 30 * 30) return { x: px, y: py };
+    }
+  }
+  return null;
+}
+
+// ---------- the lighthouse and its beam ----------
+
+function drawLighthouse(ctx, state) {
+  const x = LIGHTHOUSE_X;
+  // The dark cliff the keep stands on.
+  ctx.fillStyle = '#0c1128';
+  ctx.beginPath();
+  ctx.ellipse(x, 668, 132, 96, 0, Math.PI, 0);
+  ctx.fill();
+  // Striped tower body.
+  const body = ctx.createLinearGradient(x - 28, 0, x + 28, 0);
+  body.addColorStop(0, '#d8cbb0');
+  body.addColorStop(0.5, '#f2ead8');
+  body.addColorStop(1, '#d8cbb0');
+  ctx.fillStyle = body;
+  ctx.fillRect(x - 28, 330, 56, 232);
+  ctx.strokeStyle = 'rgba(0, 0, 0, 0.2)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(x - 28, 330, 56, 232);
+  // Two red bands around the tower.
+  ctx.fillStyle = '#d84a5a';
+  ctx.fillRect(x - 28, 415, 56, 25);
+  ctx.fillRect(x - 28, 490, 56, 25);
+  // The red cap roof.
+  ctx.fillStyle = '#c23a4a';
+  ctx.beginPath();
+  ctx.moveTo(x - 34, 332);
+  ctx.lineTo(x, 272);
+  ctx.lineTo(x + 34, 332);
+  ctx.closePath();
+  ctx.fill();
+  // The lamp room: a warm glow that never goes out.
+  glow(ctx, x, 305, 46, 'rgba(255, 220, 120, 0.6)', 0.7);
+  ctx.fillStyle = '#ffe9a8';
+  disc(ctx, x, 305, 13);
+  ctx.fill();
+  ctx.fillStyle = '#fffbe8';
+  disc(ctx, x, 305, 6);
+  ctx.fill();
+}
+
+// The beam sweeps the field from the lamp, washing softly over lanes,
+// towers and enemies alike. Drawn after the field so it lights them.
+// The beam never spins all the way around: it sways gently around a
+// low rightward aim, so the light always falls on the field.
+function drawBeam(ctx, state) {
+  const x = LIGHTHOUSE_X, y = 305;
+  const a = 0.32 + 0.28 * Math.sin(state.beamAngle);
+  const len = 780;
+  for (const [spread, alpha] of [[0.13, 0.10], [0.05, 0.10]]) {
+    const g = ctx.createLinearGradient(x, y, x + Math.cos(a) * len, y + Math.sin(a) * len);
+    g.addColorStop(0, `rgba(255, 230, 150, ${alpha})`);
+    g.addColorStop(1, 'rgba(255, 230, 150, 0)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x + Math.cos(a - spread) * len, y + Math.sin(a - spread) * len);
+    ctx.lineTo(x + Math.cos(a + spread) * len, y + Math.sin(a + spread) * len);
+    ctx.closePath();
+    ctx.fill();
+  }
+}
+
+// ---------- towers ----------
+
+function towerStats(t, state) {
+  const range = Math.round(t.def.range * (1 + 0.06 * (t.level - 1)) * (1 + state.rangeBonus));
+  const dmg = Math.round(t.def.damage * Math.pow(UPGRADE_MULT, t.level - 1) * (1 + state.damageBonus));
+  return { range, dmg };
+}
+
+function drawTower(ctx, state, t) {
+  const { x, y } = t.plot;
+  const bob = Math.sin(state.time * 2 + t.phase) * 1.5;
+
+  // Aiming barrel, pointing at the tower's current target.
   ctx.save();
-  ctx.translate(x, y + bob);
-  if (def.key === 'ember') {
-    // Stone brazier with a flame heart; higher levels add side flames.
-    ctx.fillStyle = '#5a2c12';
-    ctx.fillRect(-13, -6, 26, 16);
-    ctx.fillStyle = '#3a1a08';
-    ctx.fillRect(-16, 8, 32, 4);
-    ctx.fillStyle = def.color;
-    ctx.beginPath(); ctx.arc(0, -12, 11, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#ffe45e';
-    ctx.beginPath(); ctx.arc(0, -12, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.translate(x, y - 8 + bob);
+  ctx.rotate(t.angle);
+  ctx.strokeStyle = '#2a3358';
+  ctx.lineWidth = 5;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(16, 0);
+  ctx.stroke();
+  ctx.restore();
+
+  // Stone base.
+  ctx.fillStyle = '#1c2340';
+  disc(ctx, x, y + 4, 21);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.09)';
+  ctx.lineWidth = 1.5;
+  disc(ctx, x, y + 4, 21);
+  ctx.stroke();
+
+  glow(ctx, x, y - 6 + bob, 30, t.def.glow, t.flash > 0 ? 0.85 : 0.3);
+  const flick = Math.sin(state.time * 7 + t.phase) * 2;
+
+  if (t.key === 'ember') {
+    // A brazier bowl with a live flame tongue on top.
+    ctx.fillStyle = '#8a4a1a';
+    ctx.beginPath();
+    ctx.ellipse(x, y + 2 + bob, 15, 9, 0, 0, Math.PI);
+    ctx.fill();
+    ctx.fillStyle = '#ff9a3c';
+    disc(ctx, x, y - 6 + bob, 12);
+    ctx.fill();
+    ctx.fillStyle = '#ffd27f';
+    ctx.beginPath();
+    ctx.moveTo(x, y - 22 - flick + bob);
+    ctx.quadraticCurveTo(x + 7, y - 12 + bob, x + 3, y - 4 + bob);
+    ctx.quadraticCurveTo(x, y - 8 + bob, x - 3, y - 4 + bob);
+    ctx.quadraticCurveTo(x - 7, y - 12 + bob, x, y - 22 - flick + bob);
+    ctx.fill();
     if (t.level >= 2) {
-      ctx.fillStyle = def.color;
-      ctx.beginPath(); ctx.arc(-16, -6, 5, 0, Math.PI * 2); ctx.fill();
-      ctx.beginPath(); ctx.arc(16, -6, 5, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#ffb347';
+      disc(ctx, x - 13, y - 2 + bob, 3.5);
+      ctx.fill();
+      disc(ctx, x + 13, y - 2 + bob, 3.5);
+      ctx.fill();
     }
     if (t.level >= 3) {
-      ctx.fillStyle = '#ffe45e';
-      ctx.beginPath(); ctx.arc(-16, -6, 2.5, 0, Math.PI * 2); ctx.fill();
-      ctx.beginPath(); ctx.arc(16, -6, 2.5, 0, Math.PI * 2); ctx.fill();
-      ctx.beginPath(); ctx.arc(0, -20, 4, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#ffe9a8';
+      disc(ctx, x - 6, y - 16 + bob, 2);
+      ctx.fill();
+      disc(ctx, x + 7, y - 14 + bob, 2);
+      ctx.fill();
     }
-    if (t.flash > 0) {
-      glowCircle(ctx, 0, -14, 26, '#ffb347', 0.7);
-      ctx.fillStyle = '#fff3a0';
-      ctx.beginPath(); ctx.arc(0, -14, 7, 0, Math.PI * 2); ctx.fill();
-    }
-  } else if (def.key === 'frost') {
-    // Ice lantern on a dark plinth; higher levels grow an icicle crown.
-    ctx.fillStyle = '#123a52';
-    ctx.fillRect(-11, -4, 22, 14);
-    ctx.strokeStyle = def.color; ctx.lineWidth = 3;
-    ctx.beginPath(); ctx.arc(0, -12, 10, 0, Math.PI * 2); ctx.stroke();
-    ctx.fillStyle = def.glow;
-    ctx.beginPath(); ctx.arc(0, -12, 5, 0, Math.PI * 2); ctx.fill();
+  } else if (t.key === 'frost') {
+    // A hanging lantern, cold blue, icicles growing with level.
+    ctx.fillStyle = '#3f9fd8';
+    rr(ctx, x - 11, y - 18 + bob, 22, 22, 5);
+    ctx.fill();
+    ctx.fillStyle = '#bfe9ff';
+    disc(ctx, x, y - 7 + bob, 6.5);
+    ctx.fill();
+    ctx.strokeStyle = '#7fd4ff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(x - 11, y - 18 + bob);
+    ctx.lineTo(x + 11, y - 18 + bob);
+    ctx.stroke();
     if (t.level >= 2) {
-      ctx.strokeStyle = def.color; ctx.lineWidth = 2;
-      for (let i = -1; i <= 1; i++) {
-        ctx.beginPath(); ctx.moveTo(i * 8, -20); ctx.lineTo(i * 8, -28 - Math.abs(i) * -2); ctx.stroke();
+      ctx.fillStyle = '#d8f2ff';
+      for (const dx of [-8, 0, 8]) {
+        ctx.beginPath();
+        ctx.moveTo(x + dx - 3, y + 4 + bob);
+        ctx.lineTo(x + dx + 3, y + 4 + bob);
+        ctx.lineTo(x + dx, y + 12 + bob);
+        ctx.closePath();
+        ctx.fill();
       }
     }
     if (t.level >= 3) {
-      ctx.fillStyle = 'rgba(191,233,255,0.8)';
-      ctx.beginPath(); ctx.arc(0, -12, 13, 0, Math.PI * 2); ctx.stroke();
+      ctx.fillStyle = '#eaf8ff';
+      for (const dx of [-13, 13]) {
+        ctx.beginPath();
+        ctx.moveTo(x + dx - 3, y - 16 + bob);
+        ctx.lineTo(x + dx + 3, y - 16 + bob);
+        ctx.lineTo(x + dx, y - 6 + bob);
+        ctx.closePath();
+        ctx.fill();
+      }
     }
-    if (t.flash > 0) {
-      glowCircle(ctx, 0, -12, 24, '#aee6ff', 0.7);
-      ctx.fillStyle = '#ffffff';
-      ctx.beginPath(); ctx.arc(0, -12, 6, 0, Math.PI * 2); ctx.fill();
+  } else if (t.key === 'spark') {
+    // A coil ball with a live lightning zigzag across it.
+    ctx.fillStyle = '#d9a400';
+    disc(ctx, x, y - 6 + bob, 13);
+    ctx.fill();
+    ctx.fillStyle = '#ffe45e';
+    disc(ctx, x, y - 6 + bob, 9);
+    ctx.fill();
+    const j = Math.sin(state.time * 9 + t.phase) * 3;
+    ctx.strokeStyle = '#7a5c00';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(x - 8, y - 12 + bob);
+    ctx.lineTo(x - 2, y - 6 + bob + j);
+    ctx.lineTo(x + 3, y - 8 + bob);
+    ctx.lineTo(x + 8, y - 2 + bob);
+    ctx.stroke();
+    if (t.level >= 2) {
+      ctx.strokeStyle = 'rgba(255, 243, 160, 0.9)';
+      ctx.lineWidth = 1.5;
+      disc(ctx, x, y - 6 + bob, 18);
+      ctx.stroke();
     }
-  } else if (def.key === 'spark') {
-    // Brass coil that tracks its target; each level adds a copper ring.
-    ctx.fillStyle = '#3a2c10';
-    ctx.fillRect(-12, -2, 24, 12);
-    ctx.save(); ctx.rotate(t.angle || 0);
-    ctx.strokeStyle = def.color; ctx.lineWidth = 4;
-    ctx.beginPath(); ctx.moveTo(0, -8); ctx.lineTo(16, -8); ctx.stroke();
-    ctx.restore();
-    ctx.strokeStyle = '#8a6a2a'; ctx.lineWidth = 2;
-    for (let r = 0; r < t.level; r++) {
-      ctx.beginPath(); ctx.arc(0, -8, 4 + r * 4, 0, Math.PI * 2); ctx.stroke();
-    }
-    ctx.fillStyle = def.glow;
-    ctx.beginPath(); ctx.arc(0, -8, 7, 0, Math.PI * 2); ctx.fill();
-    if (t.flash > 0) {
-      glowCircle(ctx, 0, -8, 30, '#fff3a0', 0.8);
-      ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.moveTo(0, -8); ctx.lineTo(Math.cos(t.angle || 0) * 26, -8 + Math.sin(t.angle || 0) * 26); ctx.stroke();
+    if (t.level >= 3) {
+      ctx.strokeStyle = 'rgba(255, 243, 160, 0.55)';
+      disc(ctx, x, y - 6 + bob, 23);
+      ctx.stroke();
     }
   } else {
-    // Thorn bramble: a dark bulb with spikes; higher levels sprout more
-    // spikes and violet blooms.
-    ctx.fillStyle = '#2c1038';
-    ctx.beginPath(); ctx.arc(0, -6, 15, 0, Math.PI * 2); ctx.fill();
-    ctx.strokeStyle = def.color; ctx.lineWidth = 2.5;
-    const spikes = 6 + t.level * 2;
-    for (let i = 0; i < spikes; i++) {
-      const a = (i / spikes) * Math.PI * 2 + 0.4;
-      ctx.beginPath(); ctx.moveTo(0, -6);
-      ctx.lineTo(Math.cos(a) * 18, -6 + Math.sin(a) * 18); ctx.stroke();
+    // Thorn bramble: purple spikes radiating from a bright heart.
+    ctx.fillStyle = '#8a3fd8';
+    for (let i = 0; i < 8; i++) {
+      const a = (i / 8) * Math.PI * 2 + t.phase * 0.1;
+      ctx.beginPath();
+      ctx.moveTo(x + Math.cos(a - 0.22) * 8, y - 6 + bob + Math.sin(a - 0.22) * 8);
+      ctx.lineTo(x + Math.cos(a) * 20, y - 6 + bob + Math.sin(a) * 20);
+      ctx.lineTo(x + Math.cos(a + 0.22) * 8, y - 6 + bob + Math.sin(a + 0.22) * 8);
+      ctx.closePath();
+      ctx.fill();
     }
-    if (t.level >= 3) {
-      ctx.fillStyle = '#ff8fd0';
-      ctx.beginPath(); ctx.arc(-12, -16, 3, 0, Math.PI * 2); ctx.fill();
-      ctx.beginPath(); ctx.arc(12, -16, 3, 0, Math.PI * 2); ctx.fill();
-    }
-    ctx.fillStyle = def.glow;
-    ctx.beginPath(); ctx.arc(0, -6, 6, 0, Math.PI * 2); ctx.fill();
-    if (t.flash > 0) {
-      glowCircle(ctx, 0, -6, 28, '#d9a0ff', 0.7);
-    }
-  }
-  // Level pips.
-  for (let i = 0; i < t.level; i++) {
-    ctx.fillStyle = '#ffd27f';
-    ctx.beginPath(); ctx.arc(-12 + i * 8, 14, 3, 0, Math.PI * 2); ctx.fill();
-  }
-  ctx.restore();
-}
-
-function drawTowers(ctx, state, mouse) {
-  // Range preview for the selected tower.
-  if (state.selectedTower) {
-    const t = state.selectedTower;
-    const range = t.def.range * (1 + 0.06 * (t.level - 1)) * (1 + state.rangeBonus);
-    glowCircle(ctx, t.plot.x, t.plot.y, range, t.def.color, 0.12);
-    ctx.strokeStyle = t.def.color; ctx.globalAlpha = 0.5; ctx.lineWidth = 1.5;
-    ctx.beginPath(); ctx.arc(t.plot.x, t.plot.y, range, 0, Math.PI * 2); ctx.stroke();
-    ctx.globalAlpha = 1;
-  }
-  for (const t of state.towers) {
-    glowCircle(ctx, t.plot.x, t.plot.y - 8, 40, t.def.color, 0.25 + (t.flash > 0 ? 0.35 : 0));
-    drawTowerShape(ctx, t, t.plot.x, t.plot.y, state.time);
-    // Stunned towers (Dread Captain slam) show dizzy stars.
-    if (t.stun > 0) {
-      ctx.fillStyle = '#ffe45e'; ctx.font = 'bold 14px sans-serif'; ctx.textAlign = 'center';
-      const swirl = state.time * 6 + (t.phase || 0);
-      for (let i = 0; i < 3; i++) {
-        const a = swirl + (i / 3) * Math.PI * 2;
-        ctx.fillText('✦', t.plot.x + Math.cos(a) * 14, t.plot.y - 22 + Math.sin(a) * 4);
+    ctx.fillStyle = '#e3b8ff';
+    disc(ctx, x, y - 6 + bob, 8);
+    ctx.fill();
+    if (t.level >= 2) {
+      ctx.fillStyle = '#c98cff';
+      for (let i = 0; i < 4; i++) {
+        const a = (i / 4) * Math.PI * 2 + 0.4;
+        disc(ctx, x + Math.cos(a) * 15, y - 6 + bob + Math.sin(a) * 15, 2.5);
+        ctx.fill();
       }
     }
+    if (t.level >= 3) {
+      ctx.strokeStyle = 'rgba(201, 140, 255, 0.6)';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 5]);
+      disc(ctx, x, y - 6 + bob, 24);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
   }
-  // Build menu above the selected plot.
-  if (state.selectedPlot && !state.selectedTower) {
-    const p = state.selectedPlot;
-    const bw = 560, bh = 86;
-    const bx = Math.max(170, Math.min(VIEW_W - bw - 10, p.x - bw / 2));
-    const by = Math.max(150, p.y - 118);
-    ctx.fillStyle = 'rgba(10,12,30,0.92)';
-    roundRect(ctx, bx, by, bw, bh, 12); ctx.fill();
-    ctx.strokeStyle = '#ffd27f'; ctx.lineWidth = 1.5;
-    roundRect(ctx, bx, by, bw, bh, 12); ctx.stroke();
-    ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
-    ctx.fillStyle = '#ffd27f'; ctx.font = 'bold 14px sans-serif';
-    ctx.fillText('BUILD — click a tower (or press 1-4)', bx + 14, by + 22);
-    TOWER_KEYS.forEach((key, i) => {
-      const def = TOWERS[key];
-      const x = bx + 14 + i * 136;
-      const afford = state.gold >= def.cost;
-      ctx.fillStyle = afford ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.03)';
-      roundRect(ctx, x, by + 30, 126, 46, 8); ctx.fill();
-      ctx.fillStyle = def.color;
-      ctx.beginPath(); ctx.arc(x + 16, by + 53, 9, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = afford ? '#ffffff' : '#8a8a9a';
-      ctx.font = 'bold 12px sans-serif';
-      ctx.fillText(def.name, x + 30, by + 49);
-      ctx.fillStyle = afford ? '#ffd27f' : '#8a8a9a';
-      ctx.font = '12px sans-serif';
-      ctx.fillText(`${i + 1} · ${def.cost}g`, x + 30, by + 66);
-    });
+
+  // Muzzle flash right after a shot.
+  if (t.flash > 0) {
+    ctx.globalAlpha = (t.flash / 0.12) * 0.8;
+    ctx.fillStyle = '#ffffff';
+    disc(ctx, x + Math.cos(t.angle) * 18, y - 8 + bob + Math.sin(t.angle) * 18, 4);
+    ctx.fill();
+    ctx.globalAlpha = 1;
   }
-  // Selected tower panel.
-  if (state.selectedTower) {
-    const t = state.selectedTower;
-    const bw = 420, bh = 108;
-    const bx = Math.max(170, Math.min(VIEW_W - bw - 10, t.plot.x - bw / 2));
-    const by = Math.max(150, t.plot.y - 150);
-    ctx.fillStyle = 'rgba(10,12,30,0.92)';
-    roundRect(ctx, bx, by, bw, bh, 12); ctx.fill();
-    ctx.strokeStyle = t.def.color; ctx.lineWidth = 1.5;
-    roundRect(ctx, bx, by, bw, bh, 12); ctx.stroke();
-    ctx.fillStyle = '#ffffff'; ctx.font = 'bold 15px sans-serif'; ctx.textAlign = 'left';
-    ctx.fillText(`${t.def.name}  ·  Level ${t.level}${t.level >= 4 ? ' (MAX)' : ''}`, bx + 14, by + 24);
-    ctx.fillStyle = '#c9c9d9'; ctx.font = '13px sans-serif';
-    ctx.fillText(t.def.blurb, bx + 14, by + 44);
-    ctx.fillText(`Kills: ${t.kills}   Damage: ${Math.round(t.def.damage * Math.pow(1.55, t.level - 1))}`, bx + 14, by + 62);
-    const upCost = t.level < 4 ? UPGRADE_COST[t.level - 1] : null;
-    ctx.fillStyle = upCost && state.gold >= upCost ? '#ffd27f' : '#8a8a9a';
-    ctx.font = 'bold 13px sans-serif';
-    ctx.fillText(upCost ? `[U] Upgrade ${upCost}g` : '[MAX]', bx + 14, by + 88);
-    ctx.fillStyle = '#ff9a9a';
-    ctx.fillText(`[X] Sell +${Math.floor(t.invested * SELL_FRACTION)}g`, bx + 220, by + 88);
+
+  // Stunned by the Captain's slam: circling stars and a greyed body.
+  if (t.stun > 0) {
+    ctx.fillStyle = 'rgba(120, 130, 170, 0.35)';
+    disc(ctx, x, y - 6 + bob, 16);
+    ctx.fill();
+    ctx.fillStyle = '#ffe45e';
+    for (let i = 0; i < 3; i++) {
+      const a = state.time * 5 + (i / 3) * Math.PI * 2;
+      disc(ctx, x + Math.cos(a) * 14, y - 20 + bob + Math.sin(a) * 4, 2.2);
+      ctx.fill();
+    }
+  }
+
+  // Level pips under the base.
+  for (let i = 0; i < t.level; i++) {
+    ctx.fillStyle = GOLD;
+    disc(ctx, x + (i - (t.level - 1) / 2) * 9, y + 28, 2.6);
+    ctx.fill();
   }
 }
 
-function drawEnemies(ctx, state) {
-  for (const e of state.enemies) {
-    const wob = Math.sin(e.wobble) * 3;
-    const y = e.y + wob;
-    // Slam telegraph: a red ring grows under the boss during windup.
-    if (e.telegraph) {
-      const frac = 1 - (e.slamTimer / 0.9);
-      ctx.strokeStyle = '#ff5d7a'; ctx.globalAlpha = 0.55 + 0.45 * frac; ctx.lineWidth = 3;
-      ctx.beginPath(); ctx.arc(e.x, y, 20 + frac * (SLAM_RADIUS - 20), 0, Math.PI * 2); ctx.stroke();
-      ctx.fillStyle = '#ff5d7a'; ctx.font = 'bold 22px sans-serif'; ctx.textAlign = 'center';
-      ctx.fillText('!', e.x, y - e.radius - 26);
-      ctx.globalAlpha = 1;
+// ---------- enemies ----------
+
+function drawEnemy(ctx, state, e) {
+  const bob = Math.sin(e.wobble) * 2;
+  const x = e.x, y = e.y + bob;
+  const r = e.radius;
+
+  // The Captain's telegraph: the slam zone glows faintly red, and a
+  // ring grows under him through the windup so the player can see
+  // exactly when the slam lands.
+  if (e.telegraph) {
+    const progress = 1 - e.slamTimer / SLAM_WINDUP;
+    ctx.fillStyle = 'rgba(255, 93, 122, 0.06)';
+    disc(ctx, x, e.y, SLAM_RADIUS);
+    ctx.fill();
+    ctx.strokeStyle = `rgba(255, 93, 122, ${0.55 + 0.35 * Math.sin(state.time * 10)})`;
+    ctx.lineWidth = 3;
+    disc(ctx, x, e.y, Math.max(6, SLAM_RADIUS * progress));
+    ctx.stroke();
+  }
+
+  // Body: a rounded shadow-ghost, with a lighter crown on top.
+  const grad = ctx.createLinearGradient(x, y - r, x, y + r);
+  grad.addColorStop(0, e.def.color);
+  grad.addColorStop(1, '#2a2350');
+  ctx.fillStyle = grad;
+  if (e.key === 'dread') {
+    disc(ctx, x, y, r);
+    ctx.fill();
+    // Horns.
+    ctx.fillStyle = '#c23a4a';
+    for (const s of [-1, 1]) {
+      ctx.beginPath();
+      ctx.moveTo(x + s * (r - 12), y - r + 10);
+      ctx.lineTo(x + s * (r - 2), y - r - 12);
+      ctx.lineTo(x + s * (r - 18), y - r + 2);
+      ctx.closePath();
+      ctx.fill();
     }
-    // Spawn portal: while the boss is still off-screen right, a red
-    // whirlpool marks where he is coming through.
-    if (e.key === 'dread' && e.x > 1180) {
-      const pulse = 0.5 + 0.5 * Math.sin(state.time * 6);
-      glowCircle(ctx, 1290, e.y, 70, '#ff5d7a', 0.35 + 0.25 * pulse);
-      ctx.strokeStyle = '#ff8fa3'; ctx.lineWidth = 2.5;
-      ctx.beginPath(); ctx.arc(1290, e.y, 34 + pulse * 8, 0, Math.PI * 2); ctx.stroke();
-      ctx.beginPath(); ctx.arc(1290, e.y, 20 - pulse * 6, 0, Math.PI * 2); ctx.stroke();
-    }
-    glowCircle(ctx, e.x, y, e.radius + 14, e.def.color, 0.3);
-    ctx.save();
-    ctx.translate(e.x, y);
-    ctx.fillStyle = e.flash > 0 ? '#ffffff' : e.def.color;
-    if (e.key === 'wisp') {
-      ctx.beginPath(); ctx.arc(0, 0, e.radius, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = '#0b1030';
-      ctx.beginPath(); ctx.arc(-4, -3, 3, 0, Math.PI * 2); ctx.fill();
-      ctx.beginPath(); ctx.arc(5, -3, 3, 0, Math.PI * 2); ctx.fill();
-      ctx.strokeStyle = e.def.color; ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.moveTo(-8, -e.radius - 4); ctx.quadraticCurveTo(0, -e.radius - 14, 8, -e.radius - 4); ctx.stroke();
-    } else if (e.key === 'husk') {
-      roundRect(ctx, -e.radius, -e.radius, e.radius * 2, e.radius * 2, 7); ctx.fill();
-      ctx.fillStyle = '#2c2140';
-      ctx.beginPath(); ctx.arc(-6, -4, 4, 0, Math.PI * 2); ctx.fill();
-      ctx.beginPath(); ctx.arc(7, -4, 4, 0, Math.PI * 2); ctx.fill();
-      ctx.fillRect(-8, 8, 16, 3);
-    } else if (e.key === 'moth') {
-      ctx.beginPath(); ctx.ellipse(-8, 0, 9, 5, -0.5, 0, Math.PI * 2); ctx.fill();
-      ctx.beginPath(); ctx.ellipse(8, 0, 9, 5, 0.5, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = '#3a2c10';
-      ctx.beginPath(); ctx.arc(0, 0, 5, 0, Math.PI * 2); ctx.fill();
-    } else if (e.key === 'dread') {
-      ctx.beginPath(); ctx.arc(0, 0, e.radius, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = '#2c0a14';
-      ctx.beginPath(); ctx.moveTo(-e.radius, -6); ctx.lineTo(-e.radius - 12, -e.radius); ctx.lineTo(-e.radius + 4, -e.radius + 8); ctx.closePath(); ctx.fill();
-      ctx.beginPath(); ctx.moveTo(e.radius, -6); ctx.lineTo(e.radius + 12, -e.radius); ctx.lineTo(e.radius - 4, -e.radius + 8); ctx.closePath(); ctx.fill();
-      ctx.fillStyle = '#ffffff';
-      ctx.beginPath(); ctx.arc(-10, -6, 5, 0, Math.PI * 2); ctx.fill();
-      ctx.beginPath(); ctx.arc(10, -6, 5, 0, Math.PI * 2); ctx.fill();
-      ctx.fillStyle = '#ff5d7a';
-      ctx.beginPath(); ctx.arc(-10, -6, 2.5, 0, Math.PI * 2); ctx.fill();
-      ctx.beginPath(); ctx.arc(10, -6, 2.5, 0, Math.PI * 2); ctx.fill();
-    } else { // shade
-      ctx.beginPath(); ctx.arc(0, 2, e.radius, Math.PI, 0); ctx.closePath(); ctx.fill();
-      ctx.fillRect(-e.radius, 2, e.radius * 2, e.radius * 0.7);
-      ctx.fillStyle = '#0b1030';
-      ctx.beginPath(); ctx.arc(-5, -4, 3, 0, Math.PI * 2); ctx.fill();
-      ctx.beginPath(); ctx.arc(6, -4, 3, 0, Math.PI * 2); ctx.fill();
-    }
-    ctx.restore();
-    // Burn / slow markers.
-    if (state.time < e.burnUntil) {
-      ctx.fillStyle = '#ff9a3c'; ctx.font = 'bold 13px sans-serif'; ctx.textAlign = 'center';
-      ctx.fillText('🔥', e.x, y - e.radius - 14);
-    } else if (state.time < e.slowUntil) {
-      ctx.fillStyle = '#7fd4ff'; ctx.font = 'bold 13px sans-serif'; ctx.textAlign = 'center';
-      ctx.fillText('❄', e.x, y - e.radius - 14);
-    }
-    // HP bar.
-    const w = Math.max(28, e.radius * 2);
-    const frac = Math.max(0, e.hp / e.maxHp);
-    ctx.fillStyle = 'rgba(0,0,0,0.6)';
-    ctx.fillRect(e.x - w / 2, y - e.radius - 10, w, 5);
-    ctx.fillStyle = frac > 0.5 ? '#7be382' : frac > 0.25 ? '#ffd27f' : '#ff5d7a';
-    ctx.fillRect(e.x - w / 2, y - e.radius - 10, w * frac, 5);
+  } else {
+    rr(ctx, x - r, y - r * 0.92, r * 2, r * 1.84, r * 0.55);
+    ctx.fill();
+  }
+  ctx.strokeStyle = 'rgba(0, 0, 0, 0.28)';
+  ctx.lineWidth = 1.5;
+  if (e.key === 'dread') { disc(ctx, x, y, r); ctx.stroke(); }
+  else { rr(ctx, x - r, y - r * 0.92, r * 2, r * 1.84, r * 0.55); ctx.stroke(); }
+
+  // Moth wings, fluttering.
+  if (e.key === 'moth') {
+    const flap = 0.5 + 0.5 * Math.sin(state.time * 14 + e.wobble);
+    ctx.fillStyle = `rgba(255, 210, 127, ${0.35 + 0.4 * flap})`;
+    ctx.beginPath();
+    ctx.ellipse(x - r - 2, y - 4, 7, 4 + 3 * flap, -0.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(x + r + 2, y - 4, 7, 4 + 3 * flap, 0.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Eyes, looking toward the lighthouse they march on.
+  const er = Math.max(2.5, r * 0.26);
+  const ex = r * 0.36, ey = -r * 0.12;
+  ctx.fillStyle = '#ffffff';
+  disc(ctx, x - ex, y + ey, er);
+  ctx.fill();
+  disc(ctx, x + ex, y + ey, er);
+  ctx.fill();
+  ctx.fillStyle = '#1a1438';
+  disc(ctx, x - ex - er * 0.3, y + ey, er * 0.5);
+  ctx.fill();
+  disc(ctx, x + ex - er * 0.3, y + ey, er * 0.5);
+  ctx.fill();
+
+  // Hit flash: a white sheet over the body for a blink.
+  if (e.flash > 0) {
+    ctx.globalAlpha = (e.flash / 0.12) * 0.7;
+    ctx.fillStyle = '#ffffff';
+    if (e.key === 'dread') { disc(ctx, x, y, r); ctx.fill(); }
+    else { rr(ctx, x - r, y - r * 0.92, r * 2, r * 1.84, r * 0.55); ctx.fill(); }
+    ctx.globalAlpha = 1;
+  }
+
+  // Health bar above the head.
+  const bw = r * 2;
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+  ctx.fillRect(x - bw / 2, y - r - 12, bw, 4);
+  ctx.fillStyle = e.hp / e.maxHp > 0.5 ? '#7ee081' : '#e8b64c';
+  ctx.fillRect(x - bw / 2, y - r - 12, bw * clamp(e.hp / e.maxHp, 0, 1), 4);
+
+  // Burning and chilled markers, so the player sees the tower effects.
+  if (state.time < e.burnUntil) {
+    text(ctx, '🔥', x + r - 2, y - r - 20, '12px sans-serif', '#ffffff', 'center');
+  }
+  if (state.time < e.slowUntil) {
+    text(ctx, '❄', x - r + 2, y - r - 20, '12px sans-serif', '#aee6ff', 'center');
   }
 }
+
+// ---------- projectiles, particles, floating text ----------
 
 function drawProjectiles(ctx, state) {
   for (const p of state.projectiles) {
-    ctx.strokeStyle = p.color; ctx.globalAlpha = 0.5; ctx.lineWidth = 2;
-    ctx.beginPath();
-    p.trail.forEach((t, i) => { if (i === 0) ctx.moveTo(t.x, t.y); else ctx.lineTo(t.x, t.y); });
-    ctx.lineTo(p.x, p.y); ctx.stroke();
-    ctx.globalAlpha = 1;
-    glowCircle(ctx, p.x, p.y, 10, p.color, 0.8);
+    if (p.trail.length > 1) {
+      ctx.strokeStyle = p.color;
+      ctx.globalAlpha = 0.55;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(p.trail[0].x, p.trail[0].y);
+      for (const tp of p.trail) ctx.lineTo(tp.x, tp.y);
+      ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+    glow(ctx, p.x, p.y, 10, p.color, 0.8);
     ctx.fillStyle = '#ffffff';
-    ctx.beginPath(); ctx.arc(p.x, p.y, 3.5, 0, Math.PI * 2); ctx.fill();
+    disc(ctx, p.x, p.y, 2.2);
+    ctx.fill();
   }
 }
 
 function drawParticles(ctx, state) {
   for (const p of state.particles) {
-    const frac = Math.max(0, p.life / p.maxLife);
+    const life = clamp(p.life / p.maxLife, 0, 1);
     if (p.ring) {
-      ctx.strokeStyle = p.color; ctx.globalAlpha = frac; ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.arc(p.x, p.y, p.size + (1 - frac) * 22, 0, Math.PI * 2); ctx.stroke();
+      // A shockwave ring that grows as it fades.
+      ctx.strokeStyle = p.color;
+      ctx.globalAlpha = life * 0.8;
+      ctx.lineWidth = 3;
+      disc(ctx, p.x, p.y, Math.max(2, p.size * (1 - life)));
+      ctx.stroke();
+      ctx.globalAlpha = 1;
     } else {
-      ctx.globalAlpha = frac;
+      ctx.globalAlpha = life;
       ctx.fillStyle = p.color;
-      ctx.beginPath(); ctx.arc(p.x, p.y, p.size * frac + 0.5, 0, Math.PI * 2); ctx.fill();
+      disc(ctx, p.x, p.y, p.size);
+      ctx.fill();
+      ctx.globalAlpha = 1;
     }
   }
-  ctx.globalAlpha = 1;
 }
 
 function drawFloats(ctx, state) {
-  ctx.textAlign = 'center';
   for (const f of state.floats) {
-    ctx.globalAlpha = Math.min(1, f.life * 1.6);
-    ctx.fillStyle = f.color;
-    ctx.font = f.small ? 'bold 13px sans-serif' : 'bold 17px sans-serif';
-    ctx.fillText(f.text, f.x, f.y);
+    const a = clamp(f.life, 0, 1);
+    text(ctx, f.text, f.x, f.y, f.small ? 'bold 12px sans-serif' : 'bold 15px sans-serif', f.color, 'center', a);
   }
-  ctx.globalAlpha = 1;
 }
 
-function drawLighthouse(ctx, state) {
-  const x = LIGHTHOUSE_X, baseY = 660;
-  // Cliff.
-  ctx.fillStyle = '#1c1633';
-  ctx.beginPath();
-  ctx.moveTo(0, baseY); ctx.lineTo(0, 560); ctx.lineTo(60, 520); ctx.lineTo(150, 540);
-  ctx.lineTo(190, 600); ctx.lineTo(180, baseY); ctx.closePath(); ctx.fill();
-  // Rotating beam.
-  const ang = state.beamAngle;
-  ctx.save();
-  ctx.translate(x, 300);
-  ctx.rotate(Math.sin(ang) * 0.55);
-  const bg = ctx.createLinearGradient(0, 0, 420, 0);
-  bg.addColorStop(0, 'rgba(255,230,150,0.55)');
-  bg.addColorStop(1, 'rgba(255,230,150,0)');
-  ctx.fillStyle = bg;
-  ctx.beginPath(); ctx.moveTo(0, -8); ctx.lineTo(420, -46); ctx.lineTo(420, 46); ctx.lineTo(0, 8); ctx.closePath(); ctx.fill();
-  ctx.restore();
-  // Tower.
-  ctx.fillStyle = '#e8ddc8';
-  ctx.beginPath(); ctx.moveTo(x - 26, 560); ctx.lineTo(x - 18, 330); ctx.lineTo(x + 18, 330); ctx.lineTo(x + 26, 560); ctx.closePath(); ctx.fill();
-  ctx.fillStyle = '#c94f4f';
-  ctx.fillRect(x - 24, 500, 48, 22);
-  ctx.fillRect(x - 21, 420, 42, 22);
-  // Lamp room.
-  ctx.fillStyle = '#2c2140';
-  ctx.fillRect(x - 24, 292, 48, 40);
-  const pulse = 0.7 + 0.3 * Math.sin(state.time * 3);
-  glowCircle(ctx, x, 312, 70 * pulse, '#ffe696', 0.8);
-  ctx.fillStyle = '#ffe696';
-  ctx.beginPath(); ctx.arc(x, 312, 15, 0, Math.PI * 2); ctx.fill();
-  ctx.fillStyle = '#c94f4f';
-  ctx.beginPath(); ctx.moveTo(x - 28, 292); ctx.lineTo(x, 268); ctx.lineTo(x + 28, 292); ctx.closePath(); ctx.fill();
-  // Light meter under the lighthouse.
-  ctx.fillStyle = 'rgba(0,0,0,0.55)';
-  roundRect(ctx, 18, 664, 170, 42, 8); ctx.fill();
-  ctx.fillStyle = '#ffd27f'; ctx.font = 'bold 13px sans-serif'; ctx.textAlign = 'left';
-  ctx.fillText(`LIGHT  ${state.lives} / 20`, 28, 686);
-  ctx.fillStyle = state.lives > 6 ? '#7be382' : '#ff5d7a';
-  ctx.fillRect(28, 694, 150 * Math.max(0, state.lives / 20), 5);
+// ---------- boss bar, HUD, hint bar, light meter ----------
+
+function drawBossBar(ctx, state) {
+  const boss = state.enemies.find((e) => e.key === 'dread' && !e.dead && !e.leaked);
+  if (!boss) return;
+  text(ctx, '☠ DREAD CAPTAIN', VIEW_W / 2, 62, 'bold 13px sans-serif', '#ff8fa3', 'center');
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+  rr(ctx, VIEW_W / 2 - 300, 70, 600, 14, 7);
+  ctx.fill();
+  const frac = clamp(boss.hp / boss.maxHp, 0, 1);
+  const fill = ctx.createLinearGradient(VIEW_W / 2 - 300, 0, VIEW_W / 2 + 300, 0);
+  fill.addColorStop(0, '#ff5d7a');
+  fill.addColorStop(1, '#ff8fa3');
+  ctx.fillStyle = fill;
+  rr(ctx, VIEW_W / 2 - 300, 70, 600 * frac, 14, 7);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255, 93, 122, 0.4)';
+  ctx.lineWidth = 1.5;
+  rr(ctx, VIEW_W / 2 - 300, 70, 600, 14, 7);
+  ctx.stroke();
 }
 
 function drawHud(ctx, state) {
-  ctx.fillStyle = 'rgba(8,10,28,0.85)';
-  ctx.fillRect(0, 0, VIEW_W, 52);
-  ctx.fillStyle = '#ffd27f'; ctx.font = 'bold 22px sans-serif'; ctx.textAlign = 'left';
-  ctx.fillText('🔥 EMBERFALL KEEP', 16, 34);
-  ctx.font = 'bold 17px sans-serif'; ctx.fillStyle = '#ffffff';
-  ctx.fillText(`WAVE  ${Math.max(1, state.wave)} / ${MAX_WAVE}`, 330, 33);
-  ctx.fillStyle = '#ffd27f';
-  ctx.fillText(`◈ ${state.gold} gold`, 500, 33);
-  ctx.fillStyle = '#7be382';
-  ctx.fillText(`★ ${state.score}`, 660, 33);
-  ctx.fillStyle = '#ff8fa3';
-  ctx.fillText(`☠ ${state.kills} slain`, 800, 33);
-  ctx.fillStyle = '#c9c9d9'; ctx.font = '13px sans-serif'; ctx.textAlign = 'right';
-  const right = state.screen === 'playing'
-    ? (state.waveActive ? '[P] pause  ·  [F] fast  ·  [M] sound' : '[SPACE] start wave')
-    : '[SPACE] Start  ·  [R] Restart  ·  [M] Sound';
-  ctx.fillText(right, VIEW_W - 16, 32);
-  // Bottom hint bar during the build phase.
-  if (state.screen === 'playing' && !state.waveActive && !state.paused) {
-    ctx.fillStyle = 'rgba(8,10,28,0.7)';
-    roundRect(ctx, 380, VIEW_H - 44, 520, 32, 8); ctx.fill();
-    ctx.fillStyle = '#ffd27f'; ctx.font = 'bold 14px sans-serif'; ctx.textAlign = 'center';
-    ctx.fillText('Build towers on the glowing plots, then press SPACE to start the wave', 640, VIEW_H - 23);
+  ctx.fillStyle = 'rgba(5, 8, 24, 0.55)';
+  ctx.fillRect(0, 0, VIEW_W, 46);
+  text(ctx, '🔥 EMBERFALL KEEP', 20, 31, 'bold 22px sans-serif', GOLD, 'left');
+  text(ctx, `WAVE ${Math.max(1, state.wave)} / ${MAX_WAVE}`, 280, 31, 'bold 17px sans-serif', INK, 'left');
+  text(ctx, `◆ ${state.gold} gold`, 460, 31, 'bold 17px sans-serif', '#ffd27f', 'left');
+  text(ctx, `★ ${state.score}`, 575, 31, 'bold 17px sans-serif', '#7ee081', 'left');
+  text(ctx, `☠ ${state.kills} slain`, 685, 31, 'bold 17px sans-serif', '#ff8fa3', 'left');
+  let hints = '[P] pause · [F] fast · [M] sound';
+  if (state.screen !== 'playing') hints = '[SPACE] Start · [R] Restart · [M] Sound';
+  else if (!state.waveActive) hints = '[SPACE] start wave';
+  if (state.speed === 2) hints += ' · 2×';
+  text(ctx, hints, VIEW_W - 20, 31, '13px sans-serif', DIM, 'right');
+}
+
+function nextWaveText(state) {
+  const idx = state.wave; // waves cleared so far; the next one is index wave
+  if (idx >= WAVES.length) return '';
+  const parts = WAVES[idx].map(([key, n]) => `${n} ${ENEMIES[key].name}`);
+  return `NEXT — WAVE ${idx + 1}: ${parts.join(' · ')}`;
+}
+
+function drawHintBar(ctx, state) {
+  if (state.screen !== 'playing' || state.waveActive || state.paused) return;
+  const line1 = 'Build towers on the glowing plots, then press SPACE to start the wave';
+  const line2 = nextWaveText(state);
+  ctx.font = 'bold 16px sans-serif';
+  const w1 = ctx.measureText(line1).width;
+  ctx.font = '14px sans-serif';
+  const w2 = ctx.measureText(line2).width;
+  const pw = Math.max(w1, w2) + 48;
+  const px = (VIEW_W - pw) / 2, py = 640;
+  ctx.fillStyle = 'rgba(8, 12, 30, 0.78)';
+  rr(ctx, px, py, pw, 56, 12);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(245, 200, 110, 0.35)';
+  ctx.lineWidth = 1.5;
+  rr(ctx, px, py, pw, 56, 12);
+  ctx.stroke();
+  text(ctx, line1, VIEW_W / 2, py + 18, 'bold 16px sans-serif', GOLD, 'center');
+  if (line2) text(ctx, line2, VIEW_W / 2, py + 42, '14px sans-serif', DIM, 'center');
+}
+
+function drawLightMeter(ctx, state) {
+  const ratio = clamp(state.lives / START_LIVES, 0, 1);
+  ctx.fillStyle = 'rgba(8, 12, 30, 0.7)';
+  rr(ctx, 16, 640, 148, 58, 10);
+  ctx.fill();
+  const col = ratio > 0.5 ? '#ffd27f' : ratio > 0.25 ? '#e8b64c' : '#ff5d7a';
+  text(ctx, `LIGHT  ${state.lives} / ${START_LIVES}`, 30, 662, 'bold 14px sans-serif', col, 'left');
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+  rr(ctx, 30, 672, 120, 8, 4);
+  ctx.fill();
+  ctx.fillStyle = ratio > 0.5 ? '#7ee081' : ratio > 0.25 ? '#e8b64c' : '#ff5d7a';
+  if (ratio > 0) {
+    rr(ctx, 30, 672, 120 * ratio, 8, 4);
+    ctx.fill();
   }
 }
 
-// Boss health bar under the HUD, only while the Dread Captain lives.
-function drawBossBar(ctx, state) {
-  const boss = state.enemies.find((e) => e.key === 'dread');
-  if (!boss) return;
-  const w = 420, x = (VIEW_W - w) / 2, y = 60;
-  ctx.fillStyle = 'rgba(8,10,28,0.85)';
-  roundRect(ctx, x - 8, y - 6, w + 16, 34, 8); ctx.fill();
-  ctx.fillStyle = '#ff5d7a'; ctx.font = 'bold 13px sans-serif'; ctx.textAlign = 'center';
-  ctx.fillText('☠  DREAD CAPTAIN', VIEW_W / 2, y + 8);
-  ctx.fillStyle = 'rgba(0,0,0,0.7)';
-  ctx.fillRect(x, y + 14, w, 7);
-  const frac = Math.max(0, boss.hp / boss.maxHp);
-  ctx.fillStyle = '#ff5d7a';
-  ctx.fillRect(x, y + 14, w * frac, 7);
-}
-
-// Red vignette while the boss arrives or lives: the screen edges bleed
-// red so the final wave feels dangerous at a glance.
-function drawBossVignette(ctx, state) {
-  const pulse = 0.10 + 0.08 * Math.abs(Math.sin(state.time * 2.5));
-  const g = ctx.createRadialGradient(VIEW_W / 2, VIEW_H / 2, VIEW_H * 0.35, VIEW_W / 2, VIEW_H / 2, VIEW_H * 0.75);
-  g.addColorStop(0, 'rgba(255,40,70,0)');
-  g.addColorStop(1, `rgba(255,40,70,${pulse})`);
+// The Captain's arrival tints the whole field blood-red at the edges.
+function drawVignette(ctx, state) {
+  let strength = 0;
+  if (state.bossWarn > 0) strength = Math.max(strength, 0.22 * (state.bossWarn / 3));
+  if (state.enemies.some((e) => e.telegraph)) strength = Math.max(strength, 0.16 + 0.06 * Math.sin(state.time * 8));
+  if (strength <= 0) return;
+  const g = ctx.createRadialGradient(
+    VIEW_W / 2, VIEW_H / 2, VIEW_H * 0.42,
+    VIEW_W / 2, VIEW_H / 2, VIEW_H * 0.95,
+  );
+  g.addColorStop(0, 'rgba(255, 40, 70, 0)');
+  g.addColorStop(1, `rgba(255, 40, 70, ${strength})`);
   ctx.fillStyle = g;
   ctx.fillRect(0, 0, VIEW_W, VIEW_H);
 }
 
-function drawBanner(ctx, state) {
-  const frac = Math.min(1, state.bannerTimer / 2.2);
-  ctx.globalAlpha = Math.min(1, frac * 2);
-  ctx.fillStyle = 'rgba(8,10,28,0.75)';
-  ctx.fillRect(0, 300, VIEW_W, 64);
-  ctx.fillStyle = '#ffd27f'; ctx.font = 'bold 34px sans-serif'; ctx.textAlign = 'center';
-  ctx.fillText(state.banner, VIEW_W / 2, 343);
-  ctx.globalAlpha = 1;
+function drawPaused(ctx) {
+  ctx.fillStyle = 'rgba(8, 12, 30, 0.8)';
+  rr(ctx, VIEW_W / 2 - 190, 320, 380, 52, 12);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(245, 200, 110, 0.5)';
+  ctx.lineWidth = 1.5;
+  rr(ctx, VIEW_W / 2 - 190, 320, 380, 52, 12);
+  ctx.stroke();
+  text(ctx, 'PAUSED — press P to resume', VIEW_W / 2, 347, 'bold 18px sans-serif', GOLD, 'center');
 }
 
-function panel(ctx, x, y, w, h) {
-  ctx.fillStyle = 'rgba(8,10,28,0.88)';
-  roundRect(ctx, x, y, w, h, 16); ctx.fill();
-  ctx.strokeStyle = '#ffd27f'; ctx.lineWidth = 2;
-  roundRect(ctx, x, y, w, h, 16); ctx.stroke();
+function drawBanner(ctx, state) {
+  if (!state.banner || state.bannerTimer <= 0) return;
+  const a = clamp(state.bannerTimer, 0, 1);
+  ctx.save();
+  ctx.shadowColor = 'rgba(0, 0, 0, 0.8)';
+  ctx.shadowBlur = 12;
+  text(ctx, state.banner, VIEW_W / 2, 120, 'bold 30px sans-serif', GOLD, 'center', a);
+  ctx.restore();
+}
+
+// ---------- build menu and tower panel ----------
+
+// The build menu's hit areas live in main.js; these are the same
+// numbers, so every button the player sees is one they can click.
+function menuGeometry(plot) {
+  const bw = 560;
+  const bx = Math.max(170, Math.min(VIEW_W - bw - 10, plot.x - bw / 2));
+  const by = Math.max(150, plot.y - 118);
+  return { bx, by, bw };
+}
+
+function drawBuildMenu(ctx, state) {
+  const plot = state.selectedPlot;
+  if (!plot || state.selectedTower || state.screen !== 'playing') return;
+  const { bx, by, bw } = menuGeometry(plot);
+  ctx.fillStyle = 'rgba(10, 14, 36, 0.95)';
+  rr(ctx, bx, by, bw, 92, 12);
+  ctx.fill();
+  ctx.strokeStyle = GOLD;
+  ctx.lineWidth = 1.5;
+  rr(ctx, bx, by, bw, 92, 12);
+  ctx.stroke();
+  text(ctx, 'Build a tower', bx + 14, by + 16, 'bold 14px sans-serif', GOLD, 'left');
+  for (let i = 0; i < TOWER_KEYS.length; i++) {
+    const key = TOWER_KEYS[i];
+    const def = TOWERS[key];
+    const cx = bx + 14 + i * 136;
+    const afford = state.gold >= def.cost;
+    ctx.fillStyle = afford ? 'rgba(28, 34, 64, 0.9)' : 'rgba(20, 24, 44, 0.7)';
+    rr(ctx, cx, by + 30, 126, 46, 8);
+    ctx.fill();
+    ctx.strokeStyle = afford ? def.color : 'rgba(120, 125, 150, 0.5)';
+    ctx.lineWidth = 1.5;
+    rr(ctx, cx, by + 30, 126, 46, 8);
+    ctx.stroke();
+    ctx.fillStyle = def.color;
+    disc(ctx, cx + 13, by + 46, 7);
+    ctx.fill();
+    text(ctx, def.name, cx + 26, by + 46, 'bold 13px sans-serif', afford ? INK : DIM, 'left');
+    text(ctx, `${def.cost}g · key ${i + 1}`, cx + 63, by + 66, '11px sans-serif', afford ? GOLD : DIM, 'center');
+  }
+}
+
+function drawTowerPanel(ctx, state) {
+  const t = state.selectedTower;
+  if (!t || state.screen !== 'playing') return;
+  const { range, dmg } = towerStats(t, state);
+  // Range ring on the field, so the player sees what the tower covers.
+  ctx.fillStyle = 'rgba(245, 200, 110, 0.05)';
+  disc(ctx, t.plot.x, t.plot.y, range);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(245, 200, 110, 0.45)';
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([8, 8]);
+  disc(ctx, t.plot.x, t.plot.y, range);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Info panel, anchored above the tower (or below it near the top).
+  const pw = 216, ph = 108;
+  let px = clamp(t.plot.x - pw / 2, 10, VIEW_W - pw - 10);
+  let py = t.plot.y - 150;
+  if (py < 56) py = t.plot.y + 44;
+  ctx.fillStyle = 'rgba(10, 14, 36, 0.95)';
+  rr(ctx, px, py, pw, ph, 10);
+  ctx.fill();
+  ctx.strokeStyle = t.def.color;
+  ctx.lineWidth = 1.5;
+  rr(ctx, px, py, pw, ph, 10);
+  ctx.stroke();
+  text(ctx, `${t.def.name}  ·  Lv ${t.level}`, px + 12, py + 16, 'bold 14px sans-serif', INK, 'left');
+  text(ctx, `Damage ${dmg}  ·  Range ${range}  ·  ${t.kills} slain`, px + 12, py + 38, '12px sans-serif', DIM, 'left');
+  if (t.stun > 0) {
+    text(ctx, 'STUNNED!', px + 12, py + 58, 'bold 13px sans-serif', '#ff8fa3', 'left');
+  } else if (t.level < 4) {
+    const cost = UPGRADE_COST[t.level - 1];
+    const afford = state.gold >= cost;
+    text(ctx, `U: upgrade — ${cost}g`, px + 12, py + 58, '13px sans-serif', afford ? GOLD : DIM, 'left');
+  } else {
+    text(ctx, 'MAX LEVEL', px + 12, py + 58, 'bold 13px sans-serif', GOLD, 'left');
+  }
+  const refund = Math.floor(t.invested * SELL_FRACTION);
+  text(ctx, `X: sell — +${refund}g`, px + 12, py + 80, '13px sans-serif', DIM, 'left');
+}
+
+// ---------- full-screen panels ----------
+
+function dimField(ctx, alpha = 0.66) {
+  ctx.fillStyle = `rgba(6, 8, 26, ${alpha})`;
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
 }
 
 function drawTitle(ctx, state) {
-  ctx.fillStyle = 'rgba(5,6,20,0.55)';
-  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
-  panel(ctx, 290, 130, 700, 400);
-  ctx.textAlign = 'center';
-  ctx.fillStyle = '#ffd27f'; ctx.font = 'bold 58px sans-serif';
-  ctx.fillText('🔥 EMBERFALL KEEP', 640, 210);
-  ctx.fillStyle = '#ffffff'; ctx.font = 'bold 22px sans-serif';
-  ctx.fillText('Defend the last lighthouse from the shadow tide.', 640, 252);
-  ctx.fillStyle = '#c9c9d9'; ctx.font = '17px sans-serif';
-  ctx.fillText('Build towers on the glowing plots. Survive 10 waves.', 640, 286);
-  ctx.fillText('The Dread Captain comes on wave 10 — hold the light!', 640, 312);
-  // Tower legend.
-  TOWER_KEYS.forEach((key, i) => {
-    const def = TOWERS[key];
-    const x = 380 + i * 170;
+  dimField(ctx, 0.66);
+  const px = 235, py = 128, pw = 810, ph = 402;
+  ctx.fillStyle = 'rgba(10, 14, 36, 0.94)';
+  rr(ctx, px, py, pw, ph, 18);
+  ctx.fill();
+  ctx.strokeStyle = GOLD;
+  ctx.lineWidth = 2;
+  rr(ctx, px, py, pw, ph, 18);
+  ctx.stroke();
+  text(ctx, '🔥 EMBERFALL KEEP', VIEW_W / 2, 228, 'bold 62px sans-serif', GOLD, 'center');
+  text(ctx, 'Defend the last lighthouse from the shadow tide.', VIEW_W / 2, 264, 'bold 23px sans-serif', INK, 'center');
+  text(ctx, 'Build towers on the glowing plots. Survive 10 waves.', VIEW_W / 2, 300, '17px sans-serif', DIM, 'center');
+  text(ctx, 'The Dread Captain comes on wave 10 — hold the light!', VIEW_W / 2, 326, '17px sans-serif', DIM, 'center');
+  for (let i = 0; i < TOWER_KEYS.length; i++) {
+    const def = TOWERS[TOWER_KEYS[i]];
+    const cx = 355 + i * 200;
     ctx.fillStyle = def.color;
-    ctx.beginPath(); ctx.arc(x, 360, 12, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = '#ffffff'; ctx.font = 'bold 14px sans-serif';
-    ctx.fillText(def.name, x, 392);
-    ctx.fillStyle = '#ffd27f'; ctx.font = '13px sans-serif';
-    ctx.fillText(`${def.cost}g  ·  key ${i + 1}`, x, 412);
-  });
-  ctx.fillStyle = '#ffd27f'; ctx.font = 'bold 24px sans-serif';
-  const blink = 0.6 + 0.4 * Math.sin(state.time * 4);
-  ctx.globalAlpha = blink;
-  ctx.fillText('▶  CLICK or press SPACE to begin', 640, 478);
-  ctx.globalAlpha = 1;
-  ctx.fillStyle = '#8a8a9a'; ctx.font = '14px sans-serif';
-  ctx.fillText('Mouse: build & upgrade  ·  1-4: build  ·  U: upgrade  ·  X: sell  ·  SPACE: wave  ·  F: fast  ·  P: pause', 640, 510);
+    disc(ctx, cx, 372, 11);
+    ctx.fill();
+    text(ctx, def.name, cx, 402, 'bold 17px sans-serif', INK, 'center');
+    text(ctx, `${def.cost}g · key ${i + 1}`, cx, 426, '14px sans-serif', GOLD, 'center');
+  }
+  const pulse = 0.85 + 0.15 * Math.sin(state.time * 3);
+  text(ctx, '▶  CLICK or press SPACE to begin', VIEW_W / 2, 478, 'bold 26px sans-serif', GOLD, 'center', pulse);
+  text(ctx, 'Mouse: build & upgrade  ·  1-4: build  ·  U: upgrade  ·  X: sell  ·  SPACE: wave  ·  F: fast  ·  P: pause', VIEW_W / 2, 508, '14px sans-serif', DIM, 'center');
 }
 
 function drawBoon(ctx, state) {
-  ctx.fillStyle = 'rgba(5,6,20,0.6)';
-  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
-  panel(ctx, 240, 150, 800, 380);
-  ctx.textAlign = 'center';
-  ctx.fillStyle = '#ffd27f'; ctx.font = 'bold 34px sans-serif';
-  ctx.fillText(`WAVE ${state.wave} CLEARED!`, 640, 212);
-  ctx.fillStyle = '#ffffff'; ctx.font = '18px sans-serif';
-  ctx.fillText('The tide ebbs for a moment. Choose a blessing before the next wave:', 640, 248);
+  dimField(ctx, 0.62);
+  const px = 205, py = 148, pw = 870, ph = 384;
+  ctx.fillStyle = 'rgba(10, 14, 36, 0.94)';
+  rr(ctx, px, py, pw, ph, 18);
+  ctx.fill();
+  ctx.strokeStyle = GOLD;
+  ctx.lineWidth = 2;
+  rr(ctx, px, py, pw, ph, 18);
+  ctx.stroke();
+  text(ctx, `WAVE ${state.wave} CLEARED!`, VIEW_W / 2, 216, 'bold 40px sans-serif', GOLD, 'center');
+  text(ctx, 'The tide ebbs for a moment. Choose a blessing before the next wave:', VIEW_W / 2, 252, '19px sans-serif', INK, 'center');
   state.boonChoices.forEach((b, i) => {
-    const x = 280 + i * 260;
-    ctx.fillStyle = 'rgba(255,255,255,0.07)';
-    roundRect(ctx, x, 280, 230, 170, 14); ctx.fill();
-    ctx.strokeStyle = '#ffd27f'; ctx.lineWidth = 1.5;
-    roundRect(ctx, x, 280, 230, 170, 14); ctx.stroke();
-    ctx.fillStyle = '#ffd27f'; ctx.font = '34px sans-serif';
-    ctx.fillText(b.icon, x + 115, 330);
-    ctx.fillStyle = '#ffffff'; ctx.font = 'bold 17px sans-serif';
-    ctx.fillText(b.name, x + 115, 366);
-    ctx.fillStyle = '#c9c9d9'; ctx.font = '14px sans-serif';
-    ctx.fillText(b.desc, x + 115, 392);
-    ctx.fillStyle = '#8a8a9a'; ctx.font = '13px sans-serif';
-    ctx.fillText(`press ${i + 1}`, x + 115, 428);
+    const bx = 280 + i * 260;
+    ctx.fillStyle = 'rgba(16, 20, 44, 0.95)';
+    rr(ctx, bx, 280, 230, 170, 12);
+    ctx.fill();
+    ctx.strokeStyle = GOLD;
+    ctx.lineWidth = 1.5;
+    rr(ctx, bx, 280, 230, 170, 12);
+    ctx.stroke();
+    text(ctx, b.icon, bx + 115, 332, '38px sans-serif', GOLD, 'center');
+    text(ctx, b.name, bx + 115, 372, 'bold 19px sans-serif', INK, 'center');
+    text(ctx, b.desc, bx + 115, 398, '14px sans-serif', DIM, 'center');
+    text(ctx, `press ${i + 1}`, bx + 115, 432, '12px sans-serif', DIM, 'center');
   });
-  ctx.fillStyle = '#ffd27f'; ctx.font = 'bold 18px sans-serif';
-  ctx.fillText('Click a card or press 1, 2 or 3', 640, 500);
+  text(ctx, 'Click a card or press 1, 2 or 3', VIEW_W / 2, 500, 'bold 19px sans-serif', GOLD, 'center');
 }
 
-function drawEnd(ctx, state, won) {
-  ctx.fillStyle = won ? 'rgba(20,40,10,0.55)' : 'rgba(40,6,14,0.6)';
+function drawVictory(ctx, state) {
+  dimField(ctx, 0.6);
+  // A dawn-green wash over the field behind the panel.
+  ctx.fillStyle = 'rgba(40, 90, 60, 0.12)';
   ctx.fillRect(0, 0, VIEW_W, VIEW_H);
-  panel(ctx, 330, 160, 620, 360);
-  ctx.textAlign = 'center';
-  ctx.fillStyle = won ? '#7be382' : '#ff5d7a';
-  ctx.font = 'bold 46px sans-serif';
-  ctx.fillText(won ? '🏆 THE LIGHT HOLDS!' : '🌑 THE LIGHT FADES…', 640, 240);
-  ctx.fillStyle = '#ffffff'; ctx.font = '20px sans-serif';
-  ctx.fillText(won
-    ? 'The Dread Captain is dust. Dawn breaks over Emberfall.'
-    : `The shadow tide reached the lighthouse on wave ${state.wave}.`, 640, 282);
-  ctx.fillStyle = '#ffd27f'; ctx.font = 'bold 22px sans-serif';
-  ctx.fillText(`SCORE  ${state.score}    ·    WAVES  ${state.wave}/${MAX_WAVE}    ·    SLAIN  ${state.kills}`, 640, 336);
-  ctx.fillStyle = '#c9c9d9'; ctx.font = '16px sans-serif';
-  ctx.fillText(`Towers built: ${state.towers.length}   ·   Gold earned: ${state.goldEarned}`, 640, 368);
-  const blink = 0.6 + 0.4 * Math.sin(state.time * 4);
-  ctx.globalAlpha = blink;
-  ctx.fillStyle = '#ffd27f'; ctx.font = 'bold 24px sans-serif';
-  ctx.fillText('▶  Press R or click to play again', 640, 440);
-  ctx.globalAlpha = 1;
-  ctx.fillStyle = '#8a8a9a'; ctx.font = '14px sans-serif';
-  ctx.fillText('Emberfall Keep — an original game. No network, no files beyond this page.', 640, 480);
+  const px = 305, py = 164, pw = 670, ph = 362;
+  ctx.fillStyle = 'rgba(10, 14, 36, 0.94)';
+  rr(ctx, px, py, pw, ph, 18);
+  ctx.fill();
+  ctx.strokeStyle = GOLD;
+  ctx.lineWidth = 2;
+  rr(ctx, px, py, pw, ph, 18);
+  ctx.stroke();
+  text(ctx, '🏆 THE LIGHT HOLDS!', VIEW_W / 2, 246, 'bold 44px sans-serif', '#7ee081', 'center');
+  text(ctx, 'The Dread Captain is dust. Dawn breaks over Emberfall.', VIEW_W / 2, 284, '19px sans-serif', INK, 'center');
+  text(ctx, `SCORE  ${state.score}   ·   WAVES  10/10   ·   SLAIN  ${state.kills}`, VIEW_W / 2, 338, 'bold 21px sans-serif', GOLD, 'center');
+  text(ctx, `Towers built: ${state.towers.length}   ·   Gold earned: ${state.goldEarned}`, VIEW_W / 2, 368, '15px sans-serif', DIM, 'center');
+  const pulse = 0.85 + 0.15 * Math.sin(state.time * 3);
+  text(ctx, '▶  Press R or click to play again', VIEW_W / 2, 444, 'bold 23px sans-serif', GOLD, 'center', pulse);
+  text(ctx, 'Emberfall Keep — an original game. No network, no files beyond this page.', VIEW_W / 2, 484, '13px sans-serif', DIM, 'center');
 }
 
-function drawPaused(ctx) {
-  ctx.fillStyle = 'rgba(5,6,20,0.6)';
+function drawDefeat(ctx, state) {
+  dimField(ctx, 0.68);
+  ctx.fillStyle = 'rgba(90, 20, 40, 0.14)';
   ctx.fillRect(0, 0, VIEW_W, VIEW_H);
-  ctx.fillStyle = '#ffffff'; ctx.font = 'bold 40px sans-serif'; ctx.textAlign = 'center';
-  ctx.fillText('⏸ PAUSED', 640, 360);
-  ctx.font = '17px sans-serif'; ctx.fillStyle = '#c9c9d9';
-  ctx.fillText('Press P to resume', 640, 394);
+  const px = 305, py = 164, pw = 670, ph = 362;
+  ctx.fillStyle = 'rgba(10, 14, 36, 0.94)';
+  rr(ctx, px, py, pw, ph, 18);
+  ctx.fill();
+  ctx.strokeStyle = '#ff5d7a';
+  ctx.lineWidth = 2;
+  rr(ctx, px, py, pw, ph, 18);
+  ctx.stroke();
+  text(ctx, '💀 THE LIGHT FALLS', VIEW_W / 2, 246, 'bold 44px sans-serif', '#ff5d7a', 'center');
+  text(ctx, 'The shadow tide takes Emberfall. The lighthouse goes dark.', VIEW_W / 2, 284, '19px sans-serif', INK, 'center');
+  text(ctx, `SCORE  ${state.score}   ·   WAVES  ${state.wave}/10   ·   SLAIN  ${state.kills}`, VIEW_W / 2, 338, 'bold 21px sans-serif', GOLD, 'center');
+  text(ctx, `Towers built: ${state.towers.length}   ·   Gold earned: ${state.goldEarned}`, VIEW_W / 2, 368, '15px sans-serif', DIM, 'center');
+  const pulse = 0.85 + 0.15 * Math.sin(state.time * 3);
+  text(ctx, '▶  Press R or click to try again', VIEW_W / 2, 444, 'bold 23px sans-serif', GOLD, 'center', pulse);
+  text(ctx, 'Emberfall Keep — an original game. No network, no files beyond this page.', VIEW_W / 2, 484, '13px sans-serif', DIM, 'center');
 }

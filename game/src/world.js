@@ -73,7 +73,7 @@ function endWave(state) {
 
 export function applyBoon(state, boon) {
   if (boon.key === 'gold') state.gold += 120;
-  if (boon.key === 'repair') state.lives = Math.min(START_LIVES, state.lives + 6);
+  if (boon.key === 'repair') state.lives = Math.min(START_LIVES, state.lives + 4);
   if (boon.key === 'power') state.damageBonus += 0.15;
   if (boon.key === 'range') state.rangeBonus += 0.12;
   if (boon.key === 'haste') state.hasteBonus = Math.min(0.4, state.hasteBonus + 0.12);

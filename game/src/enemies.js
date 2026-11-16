@@ -75,13 +75,21 @@ export function updateEnemies(state, dt) {
   for (const e of state.enemies) {
     if (e.dead || e.leaked) continue;
     updateSlam(state, e, dt);
-    // Burn damage over time.
+    // Burn damage over time. A burn kill pays out exactly like a shot
+    // kill: route it through onKill so the player gets the bounty, the
+    // score and the kill count (and the tower that lit the fire gets
+    // the kill credit). Silently flagging the enemy dead here used to
+    // swallow a third of an ember army's kills.
     if (now < e.burnUntil) {
       e.burnTimer -= dt;
       if (e.burnTimer <= 0) {
         e.burnTimer = 0.5;
         e.hp -= e.burnDps * 0.5;
-        if (e.hp <= 0) { e.dead = true; continue; }
+        if (e.hp <= 0) {
+          if (e.burnTower) e.burnTower.kills += 1;
+          state.onKill(e);
+          continue;
+        }
       }
     }
     const slowed = now < e.slowUntil;

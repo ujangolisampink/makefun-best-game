@@ -95,9 +95,15 @@ export function stageShot(state, shot, audio) {
     state.boonChoices = [
       { key: 'gold', name: 'Ember Cache', desc: '+120 gold right now', icon: '◈' },
       { key: 'power', name: 'Kindled Wicks', desc: 'All towers +15% damage', icon: '▲' },
-      { key: 'repair', name: 'Mend the Light', desc: 'Restore 6 lighthouse light', icon: '✚' },
+      { key: 'repair', name: 'Mend the Light', desc: 'Restore 4 lighthouse light', icon: '✚' },
     ];
     state.gold = 342;
+    // HUD totals for a real position after five waves cleared (the
+    // showcase never fought them): a cleared wave 5 with no slain and
+    // no score would read as a staged fake.
+    state.kills = 108;
+    state.score = 7120;
+    state.goldEarned = 1980;
     return;
   }
   if (shot === 'end') {
